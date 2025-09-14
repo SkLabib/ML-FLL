@@ -1,0 +1,16 @@
+config = {
+    "client_optimizer": {
+        "lr": 0.001,  # Balanced learning rate for all clients
+        "weight_decay": 1e-4  # Regularization for overfitting clients
+    },
+    "clustering": {
+        "metric": "cosine",  # Better for high-dimensional features
+        "min_cluster_size": 2  # Prevent singleton clusters
+    },
+    "aggregation": {
+        "fair_weighting": True  # Weight by sample counts
+    },
+    "training": {
+        "gradient_clip": 1.0  # Prevent exploding gradients
+    }
+}
