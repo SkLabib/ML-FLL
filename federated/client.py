@@ -16,7 +16,7 @@ class Client:
     def __init__(self, client_id, model, train_loader, val_loader=None, 
                  criterion=None, learning_rate=0.001, device=None,
                  energy_tracker=None, accumulation_steps=4, local_epochs=3,
-                 use_scheduler=True, use_cv=False, cv_folds=5):
+                 use_scheduler=True, use_cv=False, cv_folds=5, fedprox_mu=0.01):
         """
         Initialize a federated learning client.
         
@@ -80,6 +80,13 @@ class Client:
         # Track energy efficiency
         self.energy_per_sample = 0.0
         self.training_efficiency = 0.0
+        
+        # FedProx parameters
+        self.fedprox_mu = fedprox_mu
+        self.global_model_weights = None  # Store global weights for proximal term
+        
+        # Gradient clipping parameters
+        self.max_grad_norm = 1.0  # Maximum gradient norm for clipping
     
     def train(self, epochs=None, round_num=None):
         """
@@ -176,11 +183,30 @@ class Client:
                     else:
                         outputs = self.model(inputs)
                     
-                    # Calculate loss with custom loss function if available
+                    # Calculate base loss
                     if hasattr(self.model, 'loss_fn'):
-                        loss = self.model.loss_fn(outputs, labels)
+                        base_loss = self.model.loss_fn(outputs, labels)
                     else:
-                        loss = self.criterion(outputs, labels)
+                        base_loss = self.criterion(outputs, labels)
+                    
+                    # Add FedProx proximal term if global weights available
+                    proximal_loss = 0.0
+                    if self.global_model_weights is not None and self.fedprox_mu > 0:
+                        try:
+                            for param, global_param in zip(self.model.parameters(), self.global_model_weights):
+                                if param.shape == global_param.shape:
+                                    proximal_loss += torch.norm(param - global_param.to(param.device)) ** 2
+                            proximal_loss = (self.fedprox_mu / 2) * proximal_loss
+                        except Exception as e:
+                            print(f"FedProx proximal loss calculation failed: {e}")
+                            proximal_loss = 0.0
+                    
+                    # Total loss with FedProx regularization
+                    loss = base_loss + proximal_loss
+                    
+                    # Store proximal loss for logging
+                    if proximal_loss > 0:
+                        self._last_proximal_loss = proximal_loss.item()
                     
                     # Scale loss for gradient accumulation
                     loss = loss / self.accumulation_steps
@@ -191,11 +217,13 @@ class Client:
                     # Update weights only after accumulation_steps
                     accumulation_counter += 1
                     if accumulation_counter % self.accumulation_steps == 0:
+                        # Apply gradient clipping to prevent exploding gradients
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                         self.optimizer.step()
                         self.optimizer.zero_grad()
                     
-                    # Statistics (scale loss back for reporting)
-                    running_loss += (loss.item() * self.accumulation_steps) * inputs.size(0)
+                    # Statistics (scale loss back for reporting, exclude proximal term for cleaner metrics)
+                    running_loss += (base_loss.item()) * inputs.size(0)
                     
                     # Get predictions for accuracy calculation
                     if isinstance(outputs, tuple) and len(outputs) == 4:  # Mixup/CutMix output
@@ -215,6 +243,8 @@ class Client:
                 
                 # Handle any remaining gradients
                 if accumulation_counter % self.accumulation_steps != 0:
+                    # Apply gradient clipping
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     self.optimizer.zero_grad()
                 
@@ -229,7 +259,9 @@ class Client:
                 self.train_losses.append(epoch_loss)
                 self.train_accuracies.append(epoch_acc)
                 
-                print(f"Client {self.client_id} - Epoch {epoch+1}/{epochs} - Train Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}")
+                # Log FedProx info if applicable
+                fedprox_info = f", FedProx mu={self.fedprox_mu}" if self.fedprox_mu > 0 else ""
+                print(f"Client {self.client_id} - Epoch {epoch+1}/{epochs} - Train Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}{fedprox_info}")
                 
                 # Validate if validation loader is provided
                 if self.val_loader is not None:
@@ -278,21 +310,21 @@ class Client:
         # Add differential noise to weights for guaranteed clustering divergence
         weights = self.model.get_weights()
         if round_num is not None:
-            # Add much stronger client-specific noise pattern for weight divergence
+            # Add client-specific noise pattern for weight divergence (reduced due to FedProx)
             np.random.seed(42 + self.client_id + round_num)
             for i, w in enumerate(weights):
-                # Much stronger noise for better clustering in full training
-                base_noise = 2e-3 * (self.client_id + 1)  # Increased from 1e-4
-                round_multiplier = 1 + (round_num * 0.5)  # Increase noise over rounds
+                # Moderate noise that works with FedProx regularization
+                base_noise = 1e-3 * (self.client_id + 1)  # Reduced due to FedProx
+                round_multiplier = 1 + (round_num * 0.3)  # Moderate increase
                 noise_scale = base_noise * round_multiplier
                 noise = torch.normal(0, noise_scale, w.shape, device=w.device)
                 
-                # Stronger client-specific directional bias
-                bias_scale = 1e-3 * (self.client_id + 1)  # Increased from 1e-5
+                # Client-specific directional bias
+                bias_scale = 5e-4 * (self.client_id + 1)  # Reduced for FedProx compatibility
                 bias = torch.full_like(w, bias_scale)
                 
-                # Add dataset-specific perturbation for additional diversity
-                dataset_bias = torch.normal(self.client_id * 0.01, 0.005, w.shape, device=w.device)
+                # Add dataset-specific perturbation
+                dataset_bias = torch.normal(self.client_id * 0.005, 0.002, w.shape, device=w.device)
                 
                 weights[i] = w + noise + bias + dataset_bias
         
@@ -300,6 +332,10 @@ class Client:
         if round_num is not None and round_num == 0:
             weight_norm = sum(torch.norm(w).item() for w in weights)
             print(f"Client {self.client_id} weight norm after noise: {weight_norm:.6f}")
+        
+        # Log FedProx proximal loss if applicable
+        if hasattr(self, '_last_proximal_loss') and self._last_proximal_loss > 0:
+            print(f"Client {self.client_id} final proximal loss: {self._last_proximal_loss:.6f}")
         
         # Return the model update (weights)
         return weights
@@ -462,6 +498,17 @@ class Client:
             weights: New model weights to set.
             add_initialization_noise: Whether to add dataset-specific initialization noise.
         """
+        # Store global weights for FedProx proximal term (only compatible shapes)
+        try:
+            self.global_model_weights = []
+            for param, weight in zip(self.model.parameters(), weights):
+                if param.shape == weight.shape:
+                    self.global_model_weights.append(weight.clone().detach())
+                else:
+                    self.global_model_weights.append(param.data.clone().detach())
+        except Exception as e:
+            print(f"Warning: Could not store global weights for FedProx: {e}")
+            self.global_model_weights = None
         # Add dataset-specific initialization noise if requested
         if add_initialization_noise:
             print(f"Adding dataset-specific initialization noise for client {self.client_id}")
@@ -503,3 +550,13 @@ class Client:
                 T_mult=2,
                 eta_min=current_lr * 0.01
             )
+    
+    def set_fedprox_mu(self, mu):
+        """
+        Update FedProx regularization parameter.
+        
+        Args:
+            mu (float): FedProx proximal term weight.
+        """
+        self.fedprox_mu = mu
+        print(f"Client {self.client_id}: Updated FedProx mu to {mu}")

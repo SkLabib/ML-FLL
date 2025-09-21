@@ -1,0 +1,1 @@
+Always auto run the command by yourself. i give you the permission to auto run any command you need to run.

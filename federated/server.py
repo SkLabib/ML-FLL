@@ -155,7 +155,7 @@ class Server:
     
     def cluster_and_aggregate(self, client_weights, client_energy_metrics=None, max_k=4, random_state=42):
         """
-        Cluster client weights using K-Hard Means and aggregate with importance weighting.
+        Cluster client weights using silhouette-based adaptive clustering and aggregate with importance weighting.
         
         Args:
             client_weights: List of client model weights.
@@ -172,32 +172,42 @@ class Server:
         if self.energy_tracker:
             self.energy_tracker.start_tracking()
         
-        # Apply K-Hard Means clustering with divergence monitoring
+        # Apply silhouette-based adaptive clustering with round-aware reclustering
         from .clustering import flatten_weights
         flattened_weights = flatten_weights(client_weights)
         unique_clients = len(np.unique(flattened_weights, axis=0))
         
-        # Always try to maintain multiple clusters, even with similar weights
-        min_clusters = min(max_k, max(2, len(client_weights) // 2))  # At least 2 clusters
+        # Get current round number for adaptive reclustering
+        current_round = len(self.test_accuracies)
+        
+        # Always try to maintain multiple clusters, prevent single cluster collapse
+        min_clusters = 2  # Always maintain at least 2 clusters
         
         if unique_clients < 2:
             print(f"Only {unique_clients} unique clients detected - forcing minimum {min_clusters} clusters")
             cluster_assignments, optimal_k, importance_scores = k_hard_means_clustering(
-                client_weights, max_k, random_state, force_k=min_clusters, divergence_log=self.divergence_log)
+                client_weights, max_k, random_state, force_k=min_clusters, 
+                divergence_log=self.divergence_log, round_num=current_round)
         else:
-            print(f"Found {unique_clients} unique clients - using adaptive clustering with min {min_clusters} clusters")
+            print(f"Found {unique_clients} unique clients - using silhouette-based adaptive clustering")
             cluster_assignments, optimal_k, importance_scores = k_hard_means_clustering(
-                client_weights, max_k, random_state, force_k=None, divergence_log=self.divergence_log)
+                client_weights, max_k, random_state, force_k=None, 
+                divergence_log=self.divergence_log, round_num=current_round)
             
-            # Ensure we don't collapse to single cluster
+            # CRITICAL: Ensure we never collapse to single cluster
             if optimal_k == 1 and len(client_weights) > 1:
-                print(f"Clustering collapsed to 1 cluster - forcing {min_clusters} clusters")
+                print(f"CRITICAL: Clustering collapsed to 1 cluster - forcing {min_clusters} clusters")
                 cluster_assignments, optimal_k, importance_scores = k_hard_means_clustering(
-                    client_weights, max_k, random_state, force_k=min_clusters, divergence_log=self.divergence_log)
+                    client_weights, max_k, random_state, force_k=min_clusters, 
+                    divergence_log=self.divergence_log, round_num=current_round)
         
-        print(f"Clustering results: {optimal_k} clusters identified")
+        print(f"Round {current_round} clustering results: {optimal_k} clusters identified")
         print(f"Cluster assignments: {cluster_assignments}")
         print(f"Importance scores: {importance_scores}")
+        
+        # Validate clustering stability
+        if optimal_k == 1:
+            raise ValueError(f"CRITICAL ERROR: Single cluster detected in round {current_round}! This should never happen.")
         
         # Perform cluster-wise aggregation first
         cluster_weights = {}
@@ -230,17 +240,45 @@ class Server:
                 for i, w in enumerate(weights):
                     cluster_weights[cluster_id][i] += importance * w
         
-        # Now combine cluster weights to form global weights
+        # Fed-CAM approach: Combine cluster weights with shared global component
         # Initialize global weights with zeros like the first client's weights
         global_weights = [torch.zeros_like(w) for w in client_weights[0]]
         
-        # Equal weighting for clusters (can be modified based on cluster size)
+        # Calculate cluster weights based on cluster size and importance
         num_clusters = len(cluster_weights)
         if num_clusters > 0:
-            cluster_weight = 1.0 / num_clusters
-            for cluster_id, weights in cluster_weights.items():
+            # Fed-CAM: Create shared global component (average of all clients)
+            shared_component = [torch.zeros_like(w) for w in client_weights[0]]
+            total_clients = len(client_weights)
+            
+            for weights in client_weights:
                 for i, w in enumerate(weights):
-                    global_weights[i] += cluster_weight * w
+                    shared_component[i] += w / total_clients
+            
+            # Combine clusters with shared component (70% cluster-specific, 30% shared)
+            cluster_ratio = 0.7
+            shared_ratio = 0.3
+            
+            # Weight clusters by their size and average importance
+            cluster_sizes = {}
+            cluster_importance = {}
+            
+            for cluster_id in cluster_weights.keys():
+                cluster_indices = [i for i, c in enumerate(cluster_assignments) if c == cluster_id]
+                cluster_sizes[cluster_id] = len(cluster_indices)
+                cluster_importance[cluster_id] = np.mean([importance_scores[i] for i in cluster_indices])
+            
+            # Normalize cluster weights by size and importance
+            total_weighted_size = sum(cluster_sizes[cid] * cluster_importance[cid] for cid in cluster_weights.keys())
+            
+            for cluster_id, weights in cluster_weights.items():
+                cluster_weight = (cluster_sizes[cluster_id] * cluster_importance[cluster_id]) / total_weighted_size
+                
+                for i, w in enumerate(weights):
+                    # Fed-CAM: cluster-specific + shared component
+                    cluster_component = cluster_ratio * w
+                    shared_comp = shared_ratio * shared_component[i]
+                    global_weights[i] += cluster_weight * (cluster_component + shared_comp)
         else:
             # Fallback to regular aggregation if no valid clusters
             global_weights = self.aggregate(client_weights, importance_scores, client_energy_metrics)

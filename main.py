@@ -64,11 +64,20 @@ def main(args):
         "ham10000": 7
     }
     
-    # Initialize global model using the factory
+    # Initialize global model using the factory with FedBN and cluster-specific heads
     # Use the maximum number of classes for the global model to accommodate all datasets
     max_num_classes = max(dataset_num_classes.values())  # 9 classes (pathmnist)
-    # Set grayscale=True since we'll be handling both grayscale and RGB images
-    global_model = create_model(model_type=args.model_type, model_name=args.model_name, num_classes=max_num_classes, pretrained=args.pretrained, grayscale=True)
+    # Enable FedBN and cluster-specific heads for improved accuracy
+    global_model = create_model(
+        model_type=args.model_type, 
+        model_name=args.model_name, 
+        num_classes=max_num_classes, 
+        pretrained=args.pretrained, 
+        grayscale=False,  # All inputs converted to RGB in preprocessing
+        use_fedbn=True,   # Enable FedBN for non-IID data
+        num_clusters=4,   # Support cluster-specific heads
+        client_id=0       # Global model (server)
+    )
     
     # Initialize energy tracker
     energy_tracker = EnergyTracker()
@@ -103,16 +112,26 @@ def main(args):
         train_loader = client_data['train']
         val_loader = client_data['val']
         class_weights = client_data['class_weights']
+        focal_criterion = client_data.get('focal_criterion', None)  # For HAM10000
         
-        # Create a new model instance for each client using the factory
+        # Create a new model instance for each client with FedBN and cluster-specific heads
         # Use max_num_classes for all clients to ensure compatible architectures for aggregation
         # All models now use RGB input (grayscale conversion handled in data preprocessing)
-        client_model = create_model(model_type=args.model_type, model_name=args.model_name, num_classes=max_num_classes, pretrained=args.pretrained, grayscale=False)
+        client_model = create_model(
+            model_type=args.model_type, 
+            model_name=args.model_name, 
+            num_classes=max_num_classes, 
+            pretrained=args.pretrained, 
+            grayscale=False,
+            use_fedbn=True,   # Enable FedBN for better non-IID handling
+            num_clusters=4,   # Support cluster-specific heads
+            client_id=i       # Client-specific ID
+        )
         
         # Create client energy tracker
         client_energy_tracker = ClientEnergyTracker(client_id=i, global_tracker=energy_tracker)
         
-        # Create client
+        # Create client with FedProx and focal loss support
         client = Client(
             client_id=i,
             model=client_model,
@@ -125,8 +144,14 @@ def main(args):
             local_epochs=args.local_epochs,
             use_scheduler=args.use_scheduler,
             use_cv=args.use_cv,
-            cv_folds=args.cv_folds
+            cv_folds=args.cv_folds,
+            fedprox_mu=args.fedprox_mu  # FedProx regularization
         )
+        
+        # Set focal loss criterion for HAM10000 clients
+        if focal_criterion is not None:
+            client.criterion = focal_criterion
+            print(f"Client {i} ({dataset_name}): Using Focal Loss for rare class handling")
         # Initialize client model with global model weights + dataset-specific noise
         client.update_model(global_model.get_weights(), add_initialization_noise=True)
         clients.append(client)
@@ -173,13 +198,19 @@ def main(args):
                 if round_idx >= len(energy_data["round"]):
                     energy_data["energy_client" + str(client.client_id)].append(metrics["total_energy"])
         
-        # Cluster and aggregate with importance weighting and energy efficiency
+        # Cluster and aggregate with silhouette-based adaptive clustering
         global_weights, cluster_assignments, importance_scores = server.cluster_and_aggregate(
             client_weights=client_weights,
             client_energy_metrics=client_energy_metrics if client_energy_metrics else None,
-            max_k=4,  # Fixed K=4 as per requirements
+            max_k=4,  # Maximum K=4, but adaptive based on silhouette analysis
             random_state=args.seed
         )
+        
+        # Update client cluster assignments for cluster-specific heads
+        for i, client in enumerate(clients):
+            cluster_id = cluster_assignments[i]
+            client.model.set_cluster(cluster_id)
+            print(f"Client {i} assigned to cluster {cluster_id}")
         
         # Update client importance scores
         for i, client in enumerate(clients):
@@ -343,33 +374,33 @@ if __name__ == "__main__":
     parser.add_argument("--val_split", type=float, default=0.1,
                         help="Proportion of training data to use for validation (default: 0.1)")
     
-    # Federated learning parameters
-    parser.add_argument("--num_rounds", type=int, default=30,
-                        help="Number of communication rounds (default: 30)")
-    parser.add_argument("--local_epochs", type=int, default=3,
-                        help="Number of local training epochs per round (default: 3)")
+    # Federated learning parameters - Increased for better convergence
+    parser.add_argument("--num_rounds", type=int, default=50,
+                        help="Number of communication rounds (default: 50)")
+    parser.add_argument("--local_epochs", type=int, default=5,
+                        help="Number of local training epochs per round (default: 5)")
     parser.add_argument("--selection_ratio", type=float, default=1.0,
                         help="Ratio of clients to select per round (default: 1.0)")
     parser.add_argument("--early_stopping_rounds", type=int, default=8,
                         help="Number of rounds with no improvement to trigger early stopping (default: 8)")
     
-    # Training parameters
-    parser.add_argument("--learning_rate", type=float, default=0.0001,
-                        help="Learning rate for local training (default: 0.0001)")
+    # Training parameters - Reduced LR for stability
+    parser.add_argument("--learning_rate", type=float, default=0.0005,
+                        help="Learning rate for local training (default: 0.0005)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
     parser.add_argument("--accumulation_steps", type=int, default=4,
                         help="Number of gradient accumulation steps (default: 4)")
-    parser.add_argument("--use_scheduler", action="store_true", default=True,
-                        help="Use learning rate scheduler (default: True)")
-    parser.add_argument("--use_cv", action="store_true", default=True,
-                        help="Use cross-validation for local training (default: True)")
+    parser.add_argument("--use_scheduler", action="store_true", default=False,
+                        help="Use learning rate scheduler (default: False)")
+    parser.add_argument("--use_cv", action="store_true", default=False,
+                        help="Use cross-validation for local training (default: False)")
     parser.add_argument("--cv_folds", type=int, default=5,
                         help="Number of cross-validation folds (default: 5)")
     
-    # FedProx parameters
-    parser.add_argument("--fedprox_mu", type=float, default=0.01,
-                        help="FedProx proximal term weight (default: 0.01)")
+    # FedProx parameters - Increased for better non-IID handling
+    parser.add_argument("--fedprox_mu", type=float, default=0.1,
+                        help="FedProx proximal term weight (default: 0.1)")
     
     # Model parameters
     parser.add_argument("--model_type", type=str, default="efficientnet",

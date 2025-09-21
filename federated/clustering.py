@@ -27,15 +27,16 @@ def flatten_weights(weights_list):
         flattened.append(np.concatenate(client_weights))
     return np.array(flattened)
 
-def k_hard_means_clustering(client_weights, max_k=None, random_state=42, force_k=None, divergence_log=None):
+def k_hard_means_clustering(client_weights, max_k=None, random_state=42, force_k=None, divergence_log=None, round_num=0):
     """
-    Apply K-Hard Means clustering to client model weights with automatic or fixed k selection.
+    Apply K-Hard Means clustering to client model weights with silhouette-based adaptive reclustering.
     
     Args:
         client_weights: List of client model weights.
         max_k (int): Maximum number of clusters to consider.
         random_state (int): Random seed for reproducibility.
         force_k (int): If provided, forces clustering to use this specific k value.
+        round_num (int): Current federated learning round for adaptive reclustering.
         
     Returns:
         cluster_assignments: Cluster assignment for each client.
@@ -139,8 +140,11 @@ def k_hard_means_clustering(client_weights, max_k=None, random_state=42, force_k
             print(f"Adjusting force_k from {force_k} to {n_unique}")
             force_k = n_unique
     
-    # If force_k is provided and valid, use it directly
-    if force_k is not None and 2 <= force_k <= num_clients:
+    # Adaptive reclustering: re-evaluate K every 3 rounds using silhouette analysis
+    should_reevaluate_k = (round_num % 3 == 0) or (force_k is None)
+    
+    if force_k is not None and 2 <= force_k <= num_clients and not should_reevaluate_k:
+        # Use forced K without re-evaluation (except on scheduled rounds)
         optimal_kmeans = KMeans(n_clusters=force_k, random_state=random_state, n_init=20)
         cluster_assignments = optimal_kmeans.fit_predict(scaled_weights)
         optimal_k = force_k
@@ -157,113 +161,132 @@ def k_hard_means_clustering(client_weights, max_k=None, random_state=42, force_k
         
         # Calculate silhouette score if possible
         if len(np.unique(cluster_assignments)) > 1 and len(cluster_assignments) > len(np.unique(cluster_assignments)):
-            from sklearn.metrics import silhouette_score
             silhouette = silhouette_score(scaled_weights, cluster_assignments)
             print(f"Silhouette score: {silhouette:.4f}")
     else:
-        # Try different values of k and select the best one using silhouette score
+        # Silhouette-based adaptive clustering with heterogeneity awareness
+        print(f"Round {round_num}: Performing silhouette-based adaptive reclustering...")
+        
         silhouette_scores = []
         kmeans_models = []
+        k_values = []
         
         # Start from k=2 (minimum for silhouette score)
         for k in range(2, max_k + 1):
-            kmeans = KMeans(n_clusters=k, random_state=random_state, n_init=20)
-            cluster_labels = kmeans.fit_predict(scaled_weights)
-            
-            # Skip if any cluster has only one sample (can't compute silhouette)
-            if len(np.unique(cluster_labels)) < k:
-                silhouette_scores.append(-1)  # Invalid score
-                print(f"KMeans with k={k}: Found only {len(np.unique(cluster_labels))} distinct clusters")
-            else:
-                from sklearn.metrics import silhouette_score
+            try:
+                kmeans = KMeans(n_clusters=k, random_state=random_state, n_init=20)
+                cluster_labels = kmeans.fit_predict(scaled_weights)
+                
+                # Skip if any cluster has only one sample (can't compute silhouette)
+                if len(np.unique(cluster_labels)) < k:
+                    print(f"KMeans with k={k}: Found only {len(np.unique(cluster_labels))} distinct clusters")
+                    continue
+                    
                 score = silhouette_score(scaled_weights, cluster_labels)
                 silhouette_scores.append(score)
+                kmeans_models.append(kmeans)
+                k_values.append(k)
                 print(f"KMeans with k={k}: silhouette={score:.4f}, inertia={kmeans.inertia_:.4f}")
-            
-            kmeans_models.append(kmeans)
+                
+            except Exception as e:
+                print(f"KMeans with k={k} failed: {e}")
+                continue
         
-        # Select optimal k (if all scores are invalid, use k=2)
-        if all(score == -1 for score in silhouette_scores) or len(silhouette_scores) == 0:
-            # If no valid clustering found, create a simple 2-cluster solution
+        # Adaptive K selection based on silhouette analysis
+        if not silhouette_scores:
+            # Fallback to k=2 if no valid clustering found
             optimal_k = min(2, num_clients)
-            print(f"All silhouette scores are invalid, defaulting to k={optimal_k}")
-            if optimal_k == 1:
-                cluster_assignments = np.zeros(num_clients, dtype=int)
-                # Create dummy kmeans for importance calculation
-                optimal_kmeans = type('DummyKMeans', (), {})() 
-                optimal_kmeans.cluster_centers_ = np.array([scaled_weights.mean(axis=0)])
-            else:
-                optimal_kmeans = KMeans(n_clusters=optimal_k, random_state=random_state, n_init=20)
-                cluster_assignments = optimal_kmeans.fit_predict(scaled_weights)
+            print(f"No valid silhouette scores found, defaulting to k={optimal_k}")
+            optimal_kmeans = KMeans(n_clusters=optimal_k, random_state=random_state, n_init=20)
+            cluster_assignments = optimal_kmeans.fit_predict(scaled_weights)
         else:
-            # Filter out invalid scores
-            valid_scores = [(i, score) for i, score in enumerate(silhouette_scores) if score != -1]
-            if valid_scores:
-                # Get index of best valid score
-                best_idx, best_score = max(valid_scores, key=lambda x: x[1])
-                print(f"Selected optimal k={best_idx+2} with silhouette={best_score:.4f}")
-                optimal_k = best_idx + 2  # Convert index to k value
-                optimal_kmeans = kmeans_models[best_idx]
-                cluster_assignments = optimal_kmeans.predict(scaled_weights)
+            # Find best silhouette score
+            best_idx = np.argmax(silhouette_scores)
+            best_score = silhouette_scores[best_idx]
+            optimal_k = k_values[best_idx]
+            optimal_kmeans = kmeans_models[best_idx]
+            cluster_assignments = optimal_kmeans.predict(scaled_weights)
+            
+            # Adaptive decision: keep K=2 if silhouette is best, expand only if justified
+            if optimal_k == 2 and best_score > 0.3:
+                print(f"Keeping K=2 with good silhouette score: {best_score:.4f}")
+            elif optimal_k > 2 and best_score > 0.2:
+                print(f"Expanding to K={optimal_k} due to heterogeneity (silhouette={best_score:.4f})")
             else:
-                # Fallback if somehow we have no valid scores (shouldn't happen due to earlier check)
-                optimal_k = min(2, num_clients)
-                print(f"No valid silhouette scores found, defaulting to k={optimal_k}")
-                optimal_kmeans = KMeans(n_clusters=optimal_k, random_state=random_state, n_init=20)
+                # Force K=2 if silhouette scores are poor across all K values
+                print(f"Poor silhouette scores detected, forcing K=2 for stability")
+                optimal_k = 2
+                optimal_kmeans = KMeans(n_clusters=2, random_state=random_state, n_init=20)
                 cluster_assignments = optimal_kmeans.fit_predict(scaled_weights)
         
         # Log cluster sizes
         unique_labels, counts = np.unique(cluster_assignments, return_counts=True)
-        print("Cluster sizes:")
+        print("Final cluster sizes:")
         for label, count in zip(unique_labels, counts):
             print(f"  Cluster {label}: {count} clients")
     
-    # Ensure we never have a single cluster - add artificial diversity if needed
+    # CRITICAL: Prevent single cluster collapse in full training
     if len(np.unique(cluster_assignments)) == 1 and num_clients > 1:
-        print("WARNING: KMeans assigned all clients to the same cluster. Forcing cluster diversity.")
+        print("CRITICAL: Single cluster collapse detected! Implementing anti-collapse mechanism...")
         
-        # Force minimum clusters based on number of clients
-        min_clusters = min(num_clients, max(2, num_clients // 2))  # At least 2, up to half the clients
+        # Force minimum 2 clusters to prevent collapse
+        min_clusters = 2
         
-        # Always use manual assignment for guaranteed diversity
-        print(f"Forcing {min_clusters} clusters with manual assignment")
+        # Use round-robin assignment with client-specific perturbations
+        print(f"Forcing {min_clusters} clusters with enhanced diversity mechanism")
         cluster_assignments = np.array([i % min_clusters for i in range(num_clients)])
         optimal_k = min_clusters
         
-        # Create artificial cluster centers with enhanced separation
+        # Create well-separated artificial cluster centers
         cluster_centers = []
         for k in range(optimal_k):
             cluster_indices = [i for i, c in enumerate(cluster_assignments) if c == k]
             if cluster_indices:
-                # Add cluster-specific bias to separate centers
+                # Base center from assigned clients
                 center = np.mean(scaled_weights[cluster_indices], axis=0)
-                # Add separation bias
-                separation_bias = np.random.normal(k * 0.5, 0.2, center.shape)
+                # Add strong separation bias to prevent re-collapse
+                separation_magnitude = 2.0  # Increased separation
+                separation_bias = np.random.normal(k * separation_magnitude, 0.5, center.shape)
                 center += separation_bias
             else:
-                center = scaled_weights[k % num_clients]  # Fallback
+                # Fallback with strong differentiation
+                center = scaled_weights[k % num_clients].copy()
+                center += np.random.normal(k * 2.0, 0.5, center.shape)
             cluster_centers.append(center)
         
         optimal_kmeans = type('DummyKMeans', (), {})()
         optimal_kmeans.cluster_centers_ = np.array(cluster_centers)
         
-        print(f"Forced cluster diversity: {optimal_k} clusters with assignments {cluster_assignments}")
+        print(f"Anti-collapse mechanism: {optimal_k} clusters with assignments {cluster_assignments}")
+        print(f"Cluster separation magnitude: {separation_magnitude}")
     
     # Save cluster labels for debugging (secure path)
     np.save(os.path.join(debug_dir, "cluster_labels.npy"), cluster_assignments)
     
-    # Log divergence monitoring
+    # Enhanced divergence monitoring with silhouette tracking
     if divergence_log is not None:
         weight_std = np.std(flattened_weights, axis=0).mean()
         weight_range = np.ptp(flattened_weights, axis=0).mean()
+        
+        # Calculate final silhouette score for monitoring
+        final_silhouette = -1
+        if len(np.unique(cluster_assignments)) > 1 and len(cluster_assignments) > len(np.unique(cluster_assignments)):
+            try:
+                final_silhouette = silhouette_score(scaled_weights, cluster_assignments)
+            except:
+                final_silhouette = -1
+        
         divergence_log.append({
+            'round': round_num,
             'unique_clients': n_unique,
             'clusters_found': optimal_k,
             'weight_std': weight_std,
             'weight_range': weight_range,
-            'cluster_assignments': cluster_assignments.tolist()
+            'silhouette_score': final_silhouette,
+            'cluster_assignments': cluster_assignments.tolist(),
+            'reevaluated_k': should_reevaluate_k
         })
-        print(f"Divergence monitoring: std={weight_std:.6f}, range={weight_range:.6f}, clusters={optimal_k}")
+        print(f"Divergence monitoring: std={weight_std:.6f}, range={weight_range:.6f}, clusters={optimal_k}, silhouette={final_silhouette:.4f}")
     
     # Calculate importance scores based on distance to cluster center
     # Clients closer to their cluster center are more important
@@ -282,4 +305,11 @@ def k_hard_means_clustering(client_weights, max_k=None, random_state=42, force_k
     # Normalize importance scores to sum to num_clients
     importance_scores = importance_scores * (num_clients / importance_scores.sum())
     
+    # Final validation: ensure we never return single cluster in multi-client scenario
+    if optimal_k == 1 and num_clients > 1:
+        print("FINAL CHECK: Preventing single cluster return, forcing K=2")
+        cluster_assignments = np.array([i % 2 for i in range(num_clients)])
+        optimal_k = 2
+    
+    print(f"Final clustering result: K={optimal_k}, assignments={cluster_assignments}")
     return cluster_assignments, optimal_k, importance_scores
