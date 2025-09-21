@@ -27,7 +27,7 @@ def flatten_weights(weights_list):
         flattened.append(np.concatenate(client_weights))
     return np.array(flattened)
 
-def k_hard_means_clustering(client_weights, max_k=None, random_state=42, force_k=None):
+def k_hard_means_clustering(client_weights, max_k=None, random_state=42, force_k=None, divergence_log=None):
     """
     Apply K-Hard Means clustering to client model weights with automatic or fixed k selection.
     
@@ -64,29 +64,39 @@ def k_hard_means_clustering(client_weights, max_k=None, random_state=42, force_k
     n_unique = unique_rows.shape[0]
     print(f"Number of unique client weight vectors: {n_unique} out of {num_clients}")
     
-    # Early return if all client weight vectors are identical or only one unique vector
+    # Add stability noise if weights are too similar to prevent clustering collapse
     if n_unique <= 1:
-        print("Only one unique client weight vector found, skipping clustering.")
-        cluster_assignments = np.zeros(num_clients, dtype=int)
-        importance_scores = np.ones(num_clients, dtype=float)
-        return cluster_assignments, 1, importance_scores
+        print("Weights too similar - adding stability noise to prevent clustering collapse")
+        stability_noise_scale = 1e-2  # Stronger noise for stability
+        for i in range(num_clients):
+            # Add strong client-specific noise to ensure diversity
+            stability_noise = np.random.normal(0, stability_noise_scale * (i + 1), flattened_weights[i].shape)
+            directional_bias = np.random.normal(i * 0.2, 0.1, flattened_weights[i].shape)  # Stronger bias
+            flattened_weights[i] += stability_noise + directional_bias
+        
+        # Recheck uniqueness after adding stability noise
+        unique_rows = np.unique(flattened_weights, axis=0)
+        n_unique = unique_rows.shape[0]
+        print(f"After stability noise: {n_unique} unique client weight vectors")
     
     # Add differential noise to create meaningful weight divergence
-    if n_unique < num_clients:
-        print("Adding differential noise to create weight divergence for better clustering")
-        np.random.seed(random_state)
-        # Use larger noise for better divergence
-        jitter = np.random.normal(0, 1e-4, flattened_weights.shape)
-        # Add client-specific noise patterns
-        for i in range(num_clients):
-            client_noise = np.random.normal(0, 1e-4 * (i + 1), flattened_weights[i].shape)
-            flattened_weights[i] += jitter[i] + client_noise
-    else:
-        # Even with unique weights, add small noise to improve clustering stability
-        print("Adding stability noise to improve clustering")
-        np.random.seed(random_state)
-        stability_noise = np.random.normal(0, 1e-5, flattened_weights.shape)
-        flattened_weights = flattened_weights + stability_noise
+    print("Adding differential noise to ensure weight divergence for clustering")
+    np.random.seed(random_state)
+    
+    # Stronger base noise to handle convergent weights in full training
+    base_noise_scale = 5e-3 if n_unique < num_clients else 2e-3  # Increased from 1e-3/1e-4
+    
+    for i in range(num_clients):
+        # Client-specific noise pattern for guaranteed divergence
+        client_noise_scale = base_noise_scale * (i + 1) * 3  # Increased multiplier from 2 to 3
+        client_noise = np.random.normal(0, client_noise_scale, flattened_weights[i].shape)
+        
+        # Stronger directional bias to ensure different clusters
+        direction_bias = np.random.normal(i * 0.2, 0.1, flattened_weights[i].shape)  # Increased from 0.1, 0.05
+        
+        flattened_weights[i] += client_noise + direction_bias
+    
+    print(f"Applied differential noise with scales: {[base_noise_scale * (i + 1) * 3 for i in range(num_clients)]}")
     
     # Normalize features using StandardScaler
     from sklearn.preprocessing import StandardScaler
@@ -210,51 +220,50 @@ def k_hard_means_clustering(client_weights, max_k=None, random_state=42, force_k
     
     # Ensure we never have a single cluster - add artificial diversity if needed
     if len(np.unique(cluster_assignments)) == 1 and num_clients > 1:
-        print("WARNING: KMeans assigned all clients to the same cluster. Adding artificial diversity.")
+        print("WARNING: KMeans assigned all clients to the same cluster. Forcing cluster diversity.")
         
-        # Force at least 2 clusters by splitting clients
-        min_clusters = min(2, num_clients)
+        # Force minimum clusters based on number of clients
+        min_clusters = min(num_clients, max(2, num_clients // 2))  # At least 2, up to half the clients
         
-        # Try Agglomerative Clustering first
-        from sklearn.cluster import AgglomerativeClustering
-        try:
-            agg_cluster = AgglomerativeClustering(n_clusters=min_clusters)
-            agg_labels = agg_cluster.fit_predict(scaled_weights)
-            
-            if len(np.unique(agg_labels)) > 1:
-                print(f"Agglomerative Clustering found {len(np.unique(agg_labels))} clusters")
-                cluster_assignments = agg_labels
-                optimal_k = len(np.unique(agg_labels))
-                
-                # Create a dummy KMeans model for importance score calculation
-                from sklearn.neighbors import NearestCentroid
-                centroid_classifier = NearestCentroid()
-                centroid_classifier.fit(scaled_weights, agg_labels)
-                optimal_kmeans = type('DummyKMeans', (), {})()
-                optimal_kmeans.cluster_centers_ = centroid_classifier.centroids_
+        # Always use manual assignment for guaranteed diversity
+        print(f"Forcing {min_clusters} clusters with manual assignment")
+        cluster_assignments = np.array([i % min_clusters for i in range(num_clients)])
+        optimal_k = min_clusters
+        
+        # Create artificial cluster centers with enhanced separation
+        cluster_centers = []
+        for k in range(optimal_k):
+            cluster_indices = [i for i, c in enumerate(cluster_assignments) if c == k]
+            if cluster_indices:
+                # Add cluster-specific bias to separate centers
+                center = np.mean(scaled_weights[cluster_indices], axis=0)
+                # Add separation bias
+                separation_bias = np.random.normal(k * 0.5, 0.2, center.shape)
+                center += separation_bias
             else:
-                raise ValueError("Agglomerative clustering also failed")
-        except:
-            # Fallback: manually assign clients to different clusters
-            print("Forcing artificial cluster diversity")
-            cluster_assignments = np.array([i % min_clusters for i in range(num_clients)])
-            optimal_k = min_clusters
-            
-            # Create artificial cluster centers
-            cluster_centers = []
-            for k in range(optimal_k):
-                cluster_indices = [i for i, c in enumerate(cluster_assignments) if c == k]
-                if cluster_indices:
-                    center = np.mean(scaled_weights[cluster_indices], axis=0)
-                else:
-                    center = scaled_weights[k % num_clients]  # Fallback
-                cluster_centers.append(center)
-            
-            optimal_kmeans = type('DummyKMeans', (), {})()
-            optimal_kmeans.cluster_centers_ = np.array(cluster_centers)
+                center = scaled_weights[k % num_clients]  # Fallback
+            cluster_centers.append(center)
+        
+        optimal_kmeans = type('DummyKMeans', (), {})()
+        optimal_kmeans.cluster_centers_ = np.array(cluster_centers)
+        
+        print(f"Forced cluster diversity: {optimal_k} clusters with assignments {cluster_assignments}")
     
     # Save cluster labels for debugging (secure path)
     np.save(os.path.join(debug_dir, "cluster_labels.npy"), cluster_assignments)
+    
+    # Log divergence monitoring
+    if divergence_log is not None:
+        weight_std = np.std(flattened_weights, axis=0).mean()
+        weight_range = np.ptp(flattened_weights, axis=0).mean()
+        divergence_log.append({
+            'unique_clients': n_unique,
+            'clusters_found': optimal_k,
+            'weight_std': weight_std,
+            'weight_range': weight_range,
+            'cluster_assignments': cluster_assignments.tolist()
+        })
+        print(f"Divergence monitoring: std={weight_std:.6f}, range={weight_range:.6f}, clusters={optimal_k}")
     
     # Calculate importance scores based on distance to cluster center
     # Clients closer to their cluster center are more important

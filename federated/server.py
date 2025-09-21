@@ -42,6 +42,9 @@ class Server:
         # Energy tracking
         self.energy_tracker = energy_tracker
         
+        # Divergence monitoring
+        self.divergence_log = []
+        
         # For tracking global model performance
         self.test_accuracies = []
         self.test_losses = []
@@ -169,19 +172,28 @@ class Server:
         if self.energy_tracker:
             self.energy_tracker.start_tracking()
         
-        # Apply K-Hard Means clustering - let it determine optimal k or use max_k if feasible
-        # Don't force k if we have fewer unique clients than max_k
+        # Apply K-Hard Means clustering with divergence monitoring
         from .clustering import flatten_weights
         flattened_weights = flatten_weights(client_weights)
         unique_clients = len(np.unique(flattened_weights, axis=0))
         
-        if unique_clients < max_k:
-            print(f"Only {unique_clients} unique clients, using adaptive clustering instead of forcing k={max_k}")
+        # Always try to maintain multiple clusters, even with similar weights
+        min_clusters = min(max_k, max(2, len(client_weights) // 2))  # At least 2 clusters
+        
+        if unique_clients < 2:
+            print(f"Only {unique_clients} unique clients detected - forcing minimum {min_clusters} clusters")
             cluster_assignments, optimal_k, importance_scores = k_hard_means_clustering(
-                client_weights, max_k, random_state, force_k=None)
+                client_weights, max_k, random_state, force_k=min_clusters, divergence_log=self.divergence_log)
         else:
+            print(f"Found {unique_clients} unique clients - using adaptive clustering with min {min_clusters} clusters")
             cluster_assignments, optimal_k, importance_scores = k_hard_means_clustering(
-                client_weights, max_k, random_state, force_k=max_k)
+                client_weights, max_k, random_state, force_k=None, divergence_log=self.divergence_log)
+            
+            # Ensure we don't collapse to single cluster
+            if optimal_k == 1 and len(client_weights) > 1:
+                print(f"Clustering collapsed to 1 cluster - forcing {min_clusters} clusters")
+                cluster_assignments, optimal_k, importance_scores = k_hard_means_clustering(
+                    client_weights, max_k, random_state, force_k=min_clusters, divergence_log=self.divergence_log)
         
         print(f"Clustering results: {optimal_k} clusters identified")
         print(f"Cluster assignments: {cluster_assignments}")

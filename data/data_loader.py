@@ -93,17 +93,40 @@ class MedMNISTDataset(Dataset):
         info = INFO[dataset_name]
         self.data_class = getattr(medmnist, info['python_class'])
         
-        # Create a custom transform that converts numpy arrays to PIL Images first
-        def numpy_to_pil_transform(img):
+        # Create a custom transform that ensures PIL Image format
+        def ensure_pil_transform(img):
             if isinstance(img, np.ndarray):
-                return Image.fromarray(img)
-            return img
+                # Handle different array shapes
+                if img.ndim == 2:  # Grayscale
+                    return Image.fromarray(img, mode='L')
+                elif img.ndim == 3 and img.shape[2] == 1:  # Grayscale with channel dim
+                    return Image.fromarray(img.squeeze(), mode='L')
+                elif img.ndim == 3 and img.shape[2] == 3:  # RGB
+                    return Image.fromarray(img, mode='RGB')
+                else:
+                    return Image.fromarray(img.squeeze(), mode='L')
+            elif isinstance(img, torch.Tensor):
+                # Convert tensor to numpy first, then to PIL
+                img_np = img.numpy()
+                if img_np.ndim == 2:
+                    return Image.fromarray(img_np, mode='L')
+                elif img_np.ndim == 3 and img_np.shape[0] == 1:
+                    return Image.fromarray(img_np.squeeze(), mode='L')
+                elif img_np.ndim == 3 and img_np.shape[0] == 3:
+                    return Image.fromarray(img_np.transpose(1, 2, 0), mode='RGB')
+                else:
+                    return Image.fromarray(img_np.squeeze(), mode='L')
+            elif isinstance(img, Image.Image):
+                return img
+            else:
+                # Fallback: try to convert to array first
+                return Image.fromarray(np.array(img))
             
         # Apply our transform and then the user's transform if provided
         if transform is not None:
-            dataset_transform = transforms.Compose([numpy_to_pil_transform, transform])
+            dataset_transform = transforms.Compose([ensure_pil_transform, transform])
         else:
-            dataset_transform = numpy_to_pil_transform
+            dataset_transform = ensure_pil_transform
             
         self.dataset = self.data_class(split=split, transform=dataset_transform, download=True)
         

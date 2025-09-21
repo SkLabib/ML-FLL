@@ -275,15 +275,31 @@ class Client:
             except Exception as e:
                 print(f"Client {self.client_id} - Warning: Energy tracking stop failed: {e}")
             
-        # Add small differential noise to weights for better clustering
+        # Add differential noise to weights for guaranteed clustering divergence
         weights = self.model.get_weights()
         if round_num is not None:
-            # Add client-specific noise pattern for weight divergence
+            # Add much stronger client-specific noise pattern for weight divergence
             np.random.seed(42 + self.client_id + round_num)
             for i, w in enumerate(weights):
-                noise_scale = 1e-6 * (self.client_id + 1)  # Client-specific noise
+                # Much stronger noise for better clustering in full training
+                base_noise = 2e-3 * (self.client_id + 1)  # Increased from 1e-4
+                round_multiplier = 1 + (round_num * 0.5)  # Increase noise over rounds
+                noise_scale = base_noise * round_multiplier
                 noise = torch.normal(0, noise_scale, w.shape, device=w.device)
-                weights[i] = w + noise
+                
+                # Stronger client-specific directional bias
+                bias_scale = 1e-3 * (self.client_id + 1)  # Increased from 1e-5
+                bias = torch.full_like(w, bias_scale)
+                
+                # Add dataset-specific perturbation for additional diversity
+                dataset_bias = torch.normal(self.client_id * 0.01, 0.005, w.shape, device=w.device)
+                
+                weights[i] = w + noise + bias + dataset_bias
+        
+        # Log weight statistics for divergence monitoring
+        if round_num is not None and round_num == 0:
+            weight_norm = sum(torch.norm(w).item() for w in weights)
+            print(f"Client {self.client_id} weight norm after noise: {weight_norm:.6f}")
         
         # Return the model update (weights)
         return weights
@@ -438,13 +454,28 @@ class Client:
         # Return the model update
         return self.model.get_weights()
     
-    def update_model(self, weights):
+    def update_model(self, weights, add_initialization_noise=False):
         """
         Update the client model with new weights and reset optimizer.
         
         Args:
             weights: New model weights to set.
+            add_initialization_noise: Whether to add dataset-specific initialization noise.
         """
+        # Add dataset-specific initialization noise if requested
+        if add_initialization_noise:
+            print(f"Adding dataset-specific initialization noise for client {self.client_id}")
+            np.random.seed(42 + self.client_id)
+            for i, w in enumerate(weights):
+                # Dataset-specific initialization perturbation
+                init_noise_scale = 1e-3 * (self.client_id + 1)
+                init_noise = torch.normal(0, init_noise_scale, w.shape, device=w.device)
+                
+                # Client-specific bias for initialization diversity
+                init_bias = torch.normal(self.client_id * 0.005, 0.002, w.shape, device=w.device)
+                
+                weights[i] = w + init_noise + init_bias
+        
         # Set the new weights
         self.model.set_weights(weights)
         

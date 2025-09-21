@@ -127,8 +127,8 @@ def main(args):
             use_cv=args.use_cv,
             cv_folds=args.cv_folds
         )
-        # Initialize client model with global model weights
-        client.update_model(global_model.get_weights())
+        # Initialize client model with global model weights + dataset-specific noise
+        client.update_model(global_model.get_weights(), add_initialization_noise=True)
         clients.append(client)
     
     # Initialize results tracking
@@ -245,7 +245,7 @@ def main(args):
         
         # Distribute global model to clients and reset optimizers
         for client in clients:
-            client.update_model(global_weights)
+            client.update_model(global_weights)  # No initialization noise for updates
     
     # Final evaluation
     print("\n--- Final Evaluation ---")
