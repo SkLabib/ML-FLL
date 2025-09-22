@@ -80,24 +80,30 @@ def k_hard_means_clustering(client_weights, max_k=None, random_state=42, force_k
         n_unique = unique_rows.shape[0]
         print(f"After stability noise: {n_unique} unique client weight vectors")
     
-    # Add differential noise to create meaningful weight divergence
-    print("Adding differential noise to ensure weight divergence for clustering")
-    np.random.seed(random_state)
+    # Add deterministic jitter proportional to parameter std for clustering comparison only
+    print("Adding deterministic jitter for clustering robustness")
+    np.random.seed(random_state)  # Deterministic with random_state
     
-    # Stronger base noise to handle convergent weights in full training
-    base_noise_scale = 5e-3 if n_unique < num_clients else 2e-3  # Increased from 1e-3/1e-4
+    # Calculate parameter-wise std for proportional jitter
+    param_stds = np.std(flattened_weights, axis=0)
+    param_stds = np.where(param_stds == 0, 1e-8, param_stds)  # Avoid division by zero
+    
+    # Create jittered copy for clustering (don't modify original weights)
+    jittered_weights = flattened_weights.copy()
     
     for i in range(num_clients):
-        # Client-specific noise pattern for guaranteed divergence
-        client_noise_scale = base_noise_scale * (i + 1) * 3  # Increased multiplier from 2 to 3
-        client_noise = np.random.normal(0, client_noise_scale, flattened_weights[i].shape)
+        # Proportional jitter: scale = param_std * 1e-4
+        jitter_scale = param_stds * 1e-4
+        client_jitter = np.random.normal(0, jitter_scale, jittered_weights[i].shape)
         
-        # Stronger directional bias to ensure different clusters
-        direction_bias = np.random.normal(i * 0.2, 0.1, flattened_weights[i].shape)  # Increased from 0.1, 0.05
+        # Add client-specific directional bias for guaranteed separation
+        direction_bias = np.random.normal(i * 0.1, 0.05, jittered_weights[i].shape)
         
-        flattened_weights[i] += client_noise + direction_bias
+        jittered_weights[i] += client_jitter + direction_bias
     
-    print(f"Applied differential noise with scales: {[base_noise_scale * (i + 1) * 3 for i in range(num_clients)]}")
+    # Use jittered weights for clustering analysis
+    flattened_weights = jittered_weights
+    print(f"Applied proportional jitter with mean scale: {np.mean(param_stds * 1e-4):.8f}")
     
     # Normalize features using StandardScaler
     from sklearn.preprocessing import StandardScaler
@@ -164,12 +170,13 @@ def k_hard_means_clustering(client_weights, max_k=None, random_state=42, force_k
             silhouette = silhouette_score(scaled_weights, cluster_assignments)
             print(f"Silhouette score: {silhouette:.4f}")
     else:
-        # Silhouette-based adaptive clustering with heterogeneity awareness
+        # Silhouette-based adaptive clustering with minimum threshold
         print(f"Round {round_num}: Performing silhouette-based adaptive reclustering...")
         
         silhouette_scores = []
         kmeans_models = []
         k_values = []
+        sil_thresh = 0.05  # Minimum silhouette threshold
         
         # Start from k=2 (minimum for silhouette score)
         for k in range(2, max_k + 1):
@@ -207,17 +214,18 @@ def k_hard_means_clustering(client_weights, max_k=None, random_state=42, force_k
             optimal_kmeans = kmeans_models[best_idx]
             cluster_assignments = optimal_kmeans.predict(scaled_weights)
             
-            # Adaptive decision: keep K=2 if silhouette is best, expand only if justified
-            if optimal_k == 2 and best_score > 0.3:
+            # Apply silhouette threshold check
+            if best_score < sil_thresh:
+                print(f"Silhouette score {best_score:.4f} below threshold {sil_thresh}, forcing K=2")
+                optimal_k = 2
+                optimal_kmeans = KMeans(n_clusters=2, random_state=random_state, n_init=20)
+                cluster_assignments = optimal_kmeans.fit_predict(scaled_weights)
+            elif optimal_k == 2 and best_score > 0.3:
                 print(f"Keeping K=2 with good silhouette score: {best_score:.4f}")
             elif optimal_k > 2 and best_score > 0.2:
                 print(f"Expanding to K={optimal_k} due to heterogeneity (silhouette={best_score:.4f})")
             else:
-                # Force K=2 if silhouette scores are poor across all K values
-                print(f"Poor silhouette scores detected, forcing K=2 for stability")
-                optimal_k = 2
-                optimal_kmeans = KMeans(n_clusters=2, random_state=random_state, n_init=20)
-                cluster_assignments = optimal_kmeans.fit_predict(scaled_weights)
+                print(f"Using K={optimal_k} with silhouette score: {best_score:.4f}")
         
         # Log cluster sizes
         unique_labels, counts = np.unique(cluster_assignments, return_counts=True)
@@ -263,10 +271,30 @@ def k_hard_means_clustering(client_weights, max_k=None, random_state=42, force_k
     # Save cluster labels for debugging (secure path)
     np.save(os.path.join(debug_dir, "cluster_labels.npy"), cluster_assignments)
     
-    # Enhanced divergence monitoring with silhouette tracking
+    # Weight divergence monitoring with pairwise distances
     if divergence_log is not None:
         weight_std = np.std(flattened_weights, axis=0).mean()
         weight_range = np.ptp(flattened_weights, axis=0).mean()
+        
+        # Calculate pairwise Frobenius norms for divergence monitoring
+        pairwise_dists = []
+        for i in range(num_clients):
+            for j in range(i+1, num_clients):
+                dist = np.linalg.norm(flattened_weights[i] - flattened_weights[j])
+                pairwise_dists.append(dist)
+        
+        mean_divergence = 0
+        if pairwise_dists:
+            mean_divergence = np.mean(pairwise_dists)
+            std_divergence = np.std(pairwise_dists)
+            min_divergence = np.min(pairwise_dists)
+            max_divergence = np.max(pairwise_dists)
+            
+            print(f"Weight divergence - mean: {mean_divergence:.6f}, std: {std_divergence:.6f}, min: {min_divergence:.6f}, max: {max_divergence:.6f}")
+            
+            # Check if divergence is too low
+            if mean_divergence < 1e-6:
+                print(f"WARNING: Very low weight divergence ({mean_divergence:.8f}) - consider reducing FedProx mu or increasing jitter")
         
         # Calculate final silhouette score for monitoring
         final_silhouette = -1
@@ -282,11 +310,12 @@ def k_hard_means_clustering(client_weights, max_k=None, random_state=42, force_k
             'clusters_found': optimal_k,
             'weight_std': weight_std,
             'weight_range': weight_range,
+            'mean_divergence': mean_divergence,
             'silhouette_score': final_silhouette,
             'cluster_assignments': cluster_assignments.tolist(),
             'reevaluated_k': should_reevaluate_k
         })
-        print(f"Divergence monitoring: std={weight_std:.6f}, range={weight_range:.6f}, clusters={optimal_k}, silhouette={final_silhouette:.4f}")
+        print(f"Clustering: std={weight_std:.6f}, range={weight_range:.6f}, clusters={optimal_k}, silhouette={final_silhouette:.4f}")
     
     # Calculate importance scores based on distance to cluster center
     # Clients closer to their cluster center are more important

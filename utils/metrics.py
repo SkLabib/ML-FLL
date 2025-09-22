@@ -59,7 +59,6 @@ def plot_confusion_matrix(y_true, y_pred, class_names=None, figsize=(10, 8), cma
     
     # Save to specified output directory if provided
     if output_dir:
-        import os
         os.makedirs(output_dir, exist_ok=True)
         if filename:
             save_path = os.path.join(output_dir, filename)

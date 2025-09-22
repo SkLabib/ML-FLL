@@ -257,52 +257,66 @@ def get_data_loaders(data_dir, dataset_name='ham10000', batch_size=32, test_spli
     # Check if we're using a MedMNIST dataset (grayscale) or HAM10000 (RGB)
     is_medmnist = dataset_name.lower() in ['octmnist', 'tissuemnist', 'pathmnist']
     
+    # Robust transform pipeline to handle PIL/Tensor conversion
+    def ensure_pil_and_rgb(img):
+        # Convert tensor/numpy to PIL if needed
+        if isinstance(img, torch.Tensor):
+            if img.dim() == 3 and img.shape[0] in [1, 3]:
+                img = transforms.ToPILImage()(img)
+            else:
+                img = transforms.ToPILImage()(img.squeeze())
+        elif isinstance(img, np.ndarray):
+            if img.ndim == 2:
+                img = Image.fromarray(img, mode='L')
+            elif img.ndim == 3 and img.shape[2] == 1:
+                img = Image.fromarray(img.squeeze(), mode='L')
+            elif img.ndim == 3 and img.shape[2] == 3:
+                img = Image.fromarray(img, mode='RGB')
+            else:
+                img = Image.fromarray(img.squeeze(), mode='L')
+        # Force RGB conversion
+        if hasattr(img, 'convert'):
+            img = img.convert('RGB')
+        return img
+    
     if is_medmnist:
         # MedMNIST transforms (grayscale converted to RGB)
         train_transform = transforms.Compose([
+            transforms.Lambda(ensure_pil_and_rgb),  # Robust PIL + RGB conversion
             transforms.Resize((224, 224)),
             transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
             transforms.RandomRotation(10),
-            transforms.Grayscale(num_output_channels=3),  # Convert grayscale to RGB
             transforms.ToTensor(),
-            transforms.Normalize(med_mean, med_std)  # Using RGB values for consistency
+            transforms.Normalize(med_mean, med_std)
         ])
         
         test_transform = transforms.Compose([
+            transforms.Lambda(ensure_pil_and_rgb),  # Robust PIL + RGB conversion
             transforms.Resize((224, 224)),
-            transforms.Grayscale(num_output_channels=3),  # Convert grayscale to RGB
             transforms.ToTensor(),
-            transforms.Normalize(med_mean, med_std)  # Using RGB values for consistency
+            transforms.Normalize(med_mean, med_std)
         ])
     else:
         # HAM10000 transforms (RGB) with enhanced augmentation for rare classes
         train_transform = transforms.Compose([
-            transforms.Resize((256, 256)),  # Larger initial size
-            transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),  # More aggressive cropping
+            transforms.Lambda(ensure_pil_and_rgb),  # Robust PIL + RGB conversion
+            transforms.Resize((256, 256)),
+            transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomVerticalFlip(p=0.5),
-            transforms.RandomRotation(degrees=30),  # Increased rotation
-            # Enhanced color augmentation for skin lesion diversity
+            transforms.RandomRotation(degrees=30),
             transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.15),
-            # Add elastic transform for medical image augmentation (with probability)
-            transforms.Lambda(lambda x: ElasticTransform(alpha=1, sigma=50)(x) if np.random.random() < 0.3 else x),
-            # Additional geometric transforms
-            transforms.RandomAffine(degrees=15, translate=(0.1, 0.1), scale=(0.9, 1.1), shear=10),
-            # Ensure we have PIL Image for remaining transforms
-            transforms.Lambda(lambda x: x if isinstance(x, Image.Image) else transforms.ToPILImage()(x)),
-            # Perspective transform for more diversity
-            transforms.RandomPerspective(distortion_scale=0.2, p=0.3),
-            transforms.ToTensor(),  # Convert to tensor first
-            transforms.Normalize(med_mean, med_std),  # Normalize
-            # Add random erasing for regularization (after normalization)
+            transforms.ToTensor(),
+            transforms.Normalize(med_mean, med_std),
             transforms.RandomErasing(p=0.2, scale=(0.02, 0.1))
         ])
         
         test_transform = transforms.Compose([
+            transforms.Lambda(ensure_pil_and_rgb),  # Robust PIL + RGB conversion
             transforms.Resize((224, 224)),
-            transforms.ToTensor(),  # Must be last transform
+            transforms.ToTensor(),
             transforms.Normalize(med_mean, med_std)
         ])
     
@@ -341,9 +355,9 @@ def get_data_loaders(data_dir, dataset_name='ham10000', batch_size=32, test_spli
         # Create datasets with CLAHE histogram equalization
         full_dataset = HAM10000Dataset(metadata_path, img_dir, transform=None, apply_clahe=True)
         
-        # Enhanced class balancing with WeightedRandomSampler and focal loss preparation
+        # Memory-safe class balancing with WeightedRandomSampler (no ADASYN to avoid OOM)
         if apply_smote:
-            print("Configuring enhanced class balancing for HAM10000 rare classes...")
+            print("Configuring memory-safe class balancing for HAM10000...")
             # Calculate class weights for WeightedRandomSampler
             y_train = []
             for idx in train_idx:
@@ -353,28 +367,28 @@ def get_data_loaders(data_dir, dataset_name='ham10000', batch_size=32, test_spli
             class_distribution = Counter(y_train)
             print("Class distribution:", class_distribution)
             
-            # Calculate inverse frequency weights with smoothing for rare classes
+            # Calculate inverse frequency weights with clamping for stability
             class_counts = np.bincount(y_train)
-            # Add smoothing factor to prevent extreme weights
             smoothing_factor = 0.1
             class_weights_array = 1. / (class_counts + smoothing_factor)
+            # Clamp weights to prevent extreme values
+            class_weights_array = np.clip(class_weights_array, 1e-3, 100.0)
             
-            # Apply extra boost to very rare classes (< 5% of data)
+            # Apply moderate boost to rare classes
             total_samples = len(y_train)
             for i, count in enumerate(class_counts):
-                if count < 0.05 * total_samples:  # Very rare class
-                    class_weights_array[i] *= 2.0  # Extra boost
+                if count < 0.05 * total_samples:
+                    class_weights_array[i] *= 1.5  # Moderate boost
                     print(f"Applied rare class boost to class {i} (count: {count})")
             
             sample_weights = class_weights_array[y_train]
             
-            # Store sample weights and class info for WeightedRandomSampler and focal loss
+            # Store for WeightedRandomSampler
             full_dataset.sample_weights = sample_weights
             full_dataset.class_weights_array = class_weights_array
             full_dataset.use_weighted_sampling = True
             
-            print("Enhanced class balancing configured:")
-            print(f"  - WeightedRandomSampler with rare class boost")
+            print("Memory-safe class balancing configured (no ADASYN)")
             print(f"  - Class weights: {class_weights_array}")
         
         # Create train, val, and test datasets
@@ -391,18 +405,22 @@ def get_data_loaders(data_dir, dataset_name='ham10000', batch_size=32, test_spli
         labels = [full_dataset.data_frame.iloc[i]['label'] for i in train_idx]
         class_counts = np.bincount(labels)
         
-        # Create focal loss alpha weights (inverse frequency with smoothing)
-        focal_alpha = 1. / (class_counts + 0.1)  # Add smoothing
-        focal_alpha = focal_alpha / focal_alpha.sum() * len(focal_alpha)  # Normalize
+        # Create stable focal loss alpha weights
+        focal_alpha = 1. / (class_counts + 0.1)
+        focal_alpha = np.clip(focal_alpha, 1e-3, 100.0)  # Clamp for stability
+        focal_alpha = focal_alpha / focal_alpha.sum() * len(focal_alpha)
         
         # Standard class weights for CrossEntropyLoss
         class_weights = 1. / torch.tensor(class_counts, dtype=torch.float)
+        class_weights = torch.clamp(class_weights, 1e-3, 100.0)  # Clamp for stability
         class_weights = class_weights / class_weights.sum()
         
-        # Store focal loss alpha for use in training
-        full_dataset.focal_alpha = torch.tensor(focal_alpha, dtype=torch.float)
-        
-        print(f"Focal loss alpha weights: {focal_alpha}")
+        # Validate and store focal loss alpha
+        if len(focal_alpha) == len(class_counts) and not np.any(np.isnan(focal_alpha)):
+            full_dataset.focal_alpha = torch.tensor(focal_alpha, dtype=torch.float)
+            print(f"Focal loss alpha weights: {focal_alpha}")
+        else:
+            print("Warning: Invalid focal alpha weights, skipping focal loss")
     
     else:  # MedMNIST datasets
         # Create MedMNIST datasets
@@ -469,7 +487,7 @@ def get_data_loaders(data_dir, dataset_name='ham10000', batch_size=32, test_spli
         focal_criterion = FocalLoss(alpha=full_dataset.focal_alpha, gamma=2.0)
         print("Created Focal Loss criterion for HAM10000 rare class handling")
     
-    return train_loader, val_loader, test_loader, class_weights, full_dataset, focal_criterion, focal_criterion
+    return train_loader, val_loader, test_loader, class_weights, full_dataset
 
 def get_all_dataset_loaders(data_dir, batch_size=32, test_split=0.2, val_split=0.1, seed=42, apply_smote=True):
     """

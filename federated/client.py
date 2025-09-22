@@ -86,7 +86,7 @@ class Client:
         self.global_model_weights = None  # Store global weights for proximal term
         
         # Gradient clipping parameters
-        self.max_grad_norm = 1.0  # Maximum gradient norm for clipping
+        self.max_grad_norm = 5.0  # Maximum gradient norm for clipping
     
     def train(self, epochs=None, round_num=None):
         """
@@ -203,6 +203,11 @@ class Client:
                     
                     # Total loss with FedProx regularization
                     loss = base_loss + proximal_loss
+                    
+                    # Validate loss for stability
+                    if torch.isnan(loss) or torch.isinf(loss) or loss.item() > 1e6:
+                        print(f"Client {self.client_id}: Unstable loss detected: {loss.item():.6f}, skipping batch")
+                        continue
                     
                     # Store proximal loss for logging
                     if proximal_loss > 0:
